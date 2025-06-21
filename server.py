@@ -3,42 +3,101 @@ import os
 import httpx
 import logging
 import sys
-from mcp.server.fastmcp import FastMCP
-from dotenv import load_dotenv
+import time
+from typing import Dict, Any, Optional
+from fastmcp import FastMCP
+from starlette.requests import Request
+from starlette.responses import PlainTextResponse, JSONResponse
+from config import config
+from cache_manager import CacheManager
 
 # Configure logging to write to stderr
 logging.basicConfig(
-    level=logging.INFO,
+    level=getattr(logging, config.log_level),
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     stream=sys.stderr,
 )
 logger = logging.getLogger("financial-datasets-mcp")
 
-# Initialize FastMCP server
+# Initialize FastMCP server and cache manager
 mcp = FastMCP("financial-datasets")
-
-# Constants
-FINANCIAL_DATASETS_API_BASE = "https://api.financialdatasets.ai"
+cache = CacheManager(ttl_minutes=config.cache_ttl_minutes)
 
 
-# Helper function to make API requests
-async def make_request(url: str) -> dict[str, any] | None:
-    """Make a request to the Financial Datasets API with proper error handling."""
-    # Load environment variables from .env file
-    load_dotenv()
+async def make_request(url: str, use_cache: bool = True) -> Dict[str, Any]:
+    """Make a request to the Financial Datasets API with proper error handling and caching."""
+    # Check cache first if enabled
+    if use_cache:
+        cached_data = cache.get(url)
+        if cached_data is not None:
+            logger.info(f"Cache hit for: {url}")
+            return cached_data
     
     headers = {}
-    if api_key := os.environ.get("FINANCIAL_DATASETS_API_KEY"):
-        headers["X-API-KEY"] = api_key
+    if config.api_key:
+        headers["X-API-KEY"] = config.api_key
+    else:
+        logger.warning("No API key found. Some endpoints may be rate-limited.")
 
     async with httpx.AsyncClient() as client:
         try:
-            response = await client.get(url, headers=headers, timeout=30.0)
+            logger.info(f"Making request to: {url}")
+            response = await client.get(url, headers=headers, timeout=config.default_timeout)
             response.raise_for_status()
-            return response.json()
+            
+            data = response.json()
+            logger.info(f"Successfully retrieved data from {url}")
+            
+            # Cache the successful response if caching is enabled
+            if use_cache and "Error" not in data:
+                cache.set(url, data)
+                logger.debug(f"Cached response for: {url}")
+            
+            return data
+            
+        except httpx.HTTPStatusError as e:
+            error_msg = f"HTTP {e.response.status_code} error: {e.response.text}"
+            logger.error(error_msg)
+            return {"Error": error_msg}
+        except httpx.TimeoutException:
+            error_msg = "Request timeout"
+            logger.error(error_msg)
+            return {"Error": error_msg}
         except Exception as e:
-            return {"Error": str(e)}
+            error_msg = f"Unexpected error: {str(e)}"
+            logger.error(error_msg)
+            return {"Error": error_msg}
 
+@mcp.custom_route("/health", methods=["GET"])
+async def health_check(request: Request) -> PlainTextResponse:
+    """Enhanced health check with API connectivity test and cache status."""
+    try:
+        # Test API connectivity
+        test_url = f"{config.base_url}"
+        async with httpx.AsyncClient() as client:
+            response = await client.get(test_url, timeout=config.health_check_timeout)
+            api_status = "OK" if response.status_code == 200 else "DEGRADED"
+    except Exception:
+        api_status = "ERROR"
+    
+    # Get cache statistics
+    try:
+        cache_stats = cache.stats()
+        cache_status = "OK"
+    except Exception as e:
+        cache_stats = {"error": str(e)}
+        cache_status = "ERROR"
+    
+    health_data = {
+        "status": "OK",
+        "timestamp": time.time(),
+        "api_status": api_status,
+        "cache_status": cache_status,
+        "cache_stats": cache_stats,
+        "version": "0.2.0"
+    }
+    
+    return PlainTextResponse(json.dumps(health_data))
 
 @mcp.tool()
 async def get_income_statements(
@@ -54,7 +113,7 @@ async def get_income_statements(
         limit: Number of income statements to return (default: 4)
     """
     # Fetch data from the API
-    url = f"{FINANCIAL_DATASETS_API_BASE}/financials/income-statements/?ticker={ticker}&period={period}&limit={limit}"
+    url = f"{config.base_url}/financials/income-statements/?ticker={ticker}&period={period}&limit={limit}"
     data = await make_request(url)
 
     # Check if data is found
@@ -84,9 +143,10 @@ async def get_balance_sheets(
         ticker: Ticker symbol of the company (e.g. AAPL, GOOGL)
         period: Period of the balance sheet (e.g. annual, quarterly, ttm)
         limit: Number of balance sheets to return (default: 4)
+        use_cache: Whether to use cached data if available (default: True)
     """
     # Fetch data from the API
-    url = f"{FINANCIAL_DATASETS_API_BASE}/financials/balance-sheets/?ticker={ticker}&period={period}&limit={limit}"
+    url = f"{config.base_url}/financials/balance-sheets/?ticker={ticker}&period={period}&limit={limit}"
     data = await make_request(url)
 
     # Check if data is found
@@ -118,7 +178,7 @@ async def get_cash_flow_statements(
         limit: Number of cash flow statements to return (default: 4)
     """
     # Fetch data from the API
-    url = f"{FINANCIAL_DATASETS_API_BASE}/financials/cash-flow-statements/?ticker={ticker}&period={period}&limit={limit}"
+    url = f"{config.base_url}/financials/cash-flow-statements/?ticker={ticker}&period={period}&limit={limit}"
     data = await make_request(url)
 
     # Check if data is found
@@ -142,10 +202,11 @@ async def get_current_stock_price(ticker: str) -> str:
 
     Args:
         ticker: Ticker symbol of the company (e.g. AAPL, GOOGL)
+        use_cache: Whether to use cached data if available (default: False for real-time data)
     """
     # Fetch data from the API
-    url = f"{FINANCIAL_DATASETS_API_BASE}/prices/snapshot/?ticker={ticker}"
-    data = await make_request(url)
+    url = f"{config.base_url}/prices/snapshot/?ticker={ticker}"
+    data = await make_request(url, use_cache=False)
 
     # Check if data is found
     if not data:
@@ -180,7 +241,7 @@ async def get_historical_stock_prices(
         interval_multiplier: Multiplier of the interval (e.g. 1, 2, 3)
     """
     # Fetch data from the API
-    url = f"{FINANCIAL_DATASETS_API_BASE}/prices/?ticker={ticker}&interval={interval}&interval_multiplier={interval_multiplier}&start_date={start_date}&end_date={end_date}"
+    url = f"{config.base_url}/prices/?ticker={ticker}&interval={interval}&interval_multiplier={interval_multiplier}&start_date={start_date}&end_date={end_date}"
     data = await make_request(url)
 
     # Check if data is found
@@ -206,7 +267,7 @@ async def get_company_news(ticker: str) -> str:
         ticker: Ticker symbol of the company (e.g. AAPL, GOOGL)
     """
     # Fetch data from the API
-    url = f"{FINANCIAL_DATASETS_API_BASE}/news/?ticker={ticker}"
+    url = f"{config.base_url}/news/?ticker={ticker}"
     data = await make_request(url)
 
     # Check if data is found
@@ -228,7 +289,7 @@ async def get_available_crypto_tickers() -> str:
     Gets all available crypto tickers.
     """
     # Fetch data from the API
-    url = f"{FINANCIAL_DATASETS_API_BASE}/crypto/prices/tickers"
+    url = f"{config.base_url}/crypto/prices/tickers"
     data = await make_request(url)
 
     # Check if data is found
@@ -254,7 +315,7 @@ async def get_crypto_prices(
     Gets historical prices for a crypto currency.
     """
     # Fetch data from the API
-    url = f"{FINANCIAL_DATASETS_API_BASE}/crypto/prices/?ticker={ticker}&interval={interval}&interval_multiplier={interval_multiplier}&start_date={start_date}&end_date={end_date}"
+    url = f"{config.base_url}/crypto/prices/?ticker={ticker}&interval={interval}&interval_multiplier={interval_multiplier}&start_date={start_date}&end_date={end_date}"
     data = await make_request(url)
 
     # Check if data is found
@@ -290,7 +351,7 @@ async def get_historical_crypto_prices(
         interval_multiplier: Multiplier of the interval (e.g. 1, 2, 3)
     """
     # Fetch data from the API
-    url = f"{FINANCIAL_DATASETS_API_BASE}/crypto/prices/?ticker={ticker}&interval={interval}&interval_multiplier={interval_multiplier}&start_date={start_date}&end_date={end_date}"
+    url = f"{config.base_url}/crypto/prices/?ticker={ticker}&interval={interval}&interval_multiplier={interval_multiplier}&start_date={start_date}&end_date={end_date}"
     data = await make_request(url)
 
     # Check if data is found
@@ -314,10 +375,11 @@ async def get_current_crypto_price(ticker: str) -> str:
 
     Args:
         ticker: Ticker symbol of the crypto currency (e.g. BTC-USD). The list of available crypto tickers can be retrieved via the get_available_crypto_tickers tool.
+        use_cache: Whether to use cached data if available (default: False for real-time data)
     """
     # Fetch data from the API
-    url = f"{FINANCIAL_DATASETS_API_BASE}/crypto/prices/snapshot/?ticker={ticker}"
-    data = await make_request(url)
+    url = f"{config.base_url}/crypto/prices/snapshot/?ticker={ticker}"
+    data = await make_request(url, use_cache=False)
 
     # Check if data is found
     if not data:
@@ -348,7 +410,7 @@ async def get_sec_filings(
         filing_type: Type of SEC filing (e.g. 10-K, 10-Q, 8-K)
     """
     # Fetch data from the API
-    url = f"{FINANCIAL_DATASETS_API_BASE}/filings/?ticker={ticker}&limit={limit}"
+    url = f"{config.base_url}/filings/?ticker={ticker}&limit={limit}"
     if filing_type:
         url += f"&filing_type={filing_type}"
  
@@ -365,12 +427,73 @@ async def get_sec_filings(
     # Stringify the SEC filings
     return json.dumps(filings, indent=2)
 
+@mcp.custom_route("/cache/status", methods=["GET"])
+async def cache_status(request: Request) -> JSONResponse:
+    """Get cache status and statistics."""
+    try:
+        stats = cache.stats()
+        cache_data = {
+            "cache_enabled": True,
+            "cache_ttl_minutes": config.cache_ttl_minutes,
+            "statistics": stats,
+            "timestamp": time.time()
+        }
+        return JSONResponse(cache_data)
+    except Exception as e:
+        logger.error(f"Error getting cache status: {str(e)}")
+        return JSONResponse(
+            {"error": f"Failed to get cache status: {str(e)}"}, 
+            status_code=500
+        )
+
+@mcp.custom_route("/cache/clear", methods=["POST"])
+async def cache_clear(request: Request) -> JSONResponse:
+    """Clear all cache entries."""
+    try:
+        cache.clear()
+        logger.info("Cache cleared manually via API")
+        return JSONResponse({
+            "message": "Cache cleared successfully",
+            "timestamp": time.time()
+        })
+    except Exception as e:
+        logger.error(f"Error clearing cache: {str(e)}")
+        return JSONResponse(
+            {"error": f"Failed to clear cache: {str(e)}"}, 
+            status_code=500
+        )
+
+@mcp.custom_route("/cache/cleanup", methods=["POST"])
+async def cache_cleanup(request: Request) -> JSONResponse:
+    """Clean up expired cache entries."""
+    try:
+        expired_count = cache.cleanup_expired()
+        logger.info(f"Cache cleanup completed, removed {expired_count} expired entries")
+        return JSONResponse({
+            "message": f"Cache cleanup completed",
+            "expired_entries_removed": expired_count,
+            "timestamp": time.time()
+        })
+    except Exception as e:
+        logger.error(f"Error cleaning up cache: {str(e)}")
+        return JSONResponse(
+            {"error": f"Failed to cleanup cache: {str(e)}"}, 
+            status_code=500
+        )
+
 if __name__ == "__main__":
     # Log server startup
     logger.info("Starting Financial Datasets MCP Server...")
+    logger.info(f"Cache enabled with TTL: {config.cache_ttl_minutes} minutes")
+    logger.info(f"Transport type: {config.transport_type}")
 
     # Initialize and run the server
-    mcp.run(transport="stdio")
+    if config.transport_type == "streamable-http":
+        mcp.run(transport='streamable-http', host=config.host, port=config.port)
+    elif config.transport_type == "sse":
+        mcp.run(transport='sse', port=config.port)
+    else:
+        mcp.run(transport="stdio")
 
     # This line won't be reached during normal operation
     logger.info("Server stopped")

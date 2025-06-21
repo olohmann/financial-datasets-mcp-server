@@ -1,0 +1,38 @@
+version: '3.8'
+
+services:
+  mcp-server:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    environment:
+      # Required: Financial Datasets API key
+      - FINANCIAL_DATASETS_API_KEY=${FINANCIAL_DATASETS_API_KEY}
+      
+      # Server configuration
+      - MCP_TRANSPORT=${MCP_TRANSPORT:-stdio}
+      - MCP_HOST=${MCP_HOST:-127.0.0.1}
+      - MCP_PORT=${MCP_PORT:-8000}
+      
+      # Optional settings
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+      - CACHE_TTL_MINUTES=${CACHE_TTL_MINUTES:-10}
+      - API_TIMEOUT=${API_TIMEOUT:-30.0}
+      
+    ports:
+      # Port mapping for HTTP/SSE modes
+      - "${MCP_PORT:-8000}:${MCP_PORT:-8000}"
+      
+    volumes:
+      # Mount .env file for configuration
+      - ./.env:/app/.env:ro
+      
+    restart: unless-stopped
+    
+    # Health check to ensure service is running
+    healthcheck:
+      test: ["CMD", "pgrep", "-f", "server.py"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
