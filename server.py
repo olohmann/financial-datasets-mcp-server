@@ -491,7 +491,7 @@ if __name__ == "__main__":
     if config.transport_type == "streamable-http":
         mcp.run(transport='streamable-http', host=config.host, port=config.port)
     elif config.transport_type == "sse":
-        mcp.run(transport='sse', port=config.port)
+        mcp.run(transport='sse', host=config.host, port=config.port)
     else:
         mcp.run(transport="stdio")
 
