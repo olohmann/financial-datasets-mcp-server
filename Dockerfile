@@ -21,6 +21,11 @@ COPY README.md ./
 # Create a non-root user for security
 RUN adduser -D -s /bin/sh app && \
     chown -R app:app /app
+
+# Create a writable cache directory for uv
+RUN mkdir -p /tmp/uv-cache && \
+    chown -R app:app /tmp/uv-cache
+
 USER app
 
 # Expose port for HTTP mode (optional)
@@ -29,6 +34,7 @@ EXPOSE 8000
 # Set environment variables
 ENV PYTHONUNBUFFERED=1
 ENV PYTHONPATH=/app
+ENV UV_CACHE_DIR=/tmp/uv-cache
 
 # Default command runs the MCP server in stdio mode
 CMD ["uv", "run", "python", "server.py"]
